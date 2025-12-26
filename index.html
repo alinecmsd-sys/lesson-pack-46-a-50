@@ -12,15 +12,13 @@
         #root { min-height: 100vh; }
     </style>
     <script>
-        // Shim robusto para o ambiente de navegador
-        if (typeof window.process === 'undefined') {
-            window.process = {
-                env: {
-                    NODE_ENV: 'production',
-                    API_KEY: '' // Será preenchido pelo injetor de segredos se disponível
-                }
-            };
-        }
+        // Define process.env globalmente antes de qualquer importação de módulo
+        window.process = { 
+            env: { 
+                NODE_ENV: 'production',
+                API_KEY: '' 
+            } 
+        };
     </script>
     <script type="importmap">
 {
@@ -37,7 +35,6 @@
 </head>
 <body class="bg-slate-50 text-slate-900">
     <div id="root"></div>
-    <!-- O index.tsx será carregado como um módulo ES6 -->
     <script type="module" src="index.tsx"></script>
 </body>
 </html>
