@@ -1,6 +1,6 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 
-// Helpers para processamento de áudio binário (PCM 16-bit)
+// Helpers para processamento de áudio PCM 16-bit
 function decodeBase64(base64: string): Uint8Array {
   const binaryString = atob(base64);
   const bytes = new Uint8Array(binaryString.length);
@@ -16,7 +16,7 @@ async function decodeAudioData(
   sampleRate: number,
   numChannels: number,
 ): Promise<AudioBuffer> {
-  // Converte o buffer bruto em inteiros de 16 bits
+  // Converte buffer raw para PCM 16-bit
   const dataInt16 = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
@@ -24,21 +24,21 @@ async function decodeAudioData(
   for (let channel = 0; channel < numChannels; channel++) {
     const channelData = buffer.getChannelData(channel);
     for (let i = 0; i < frameCount; i++) {
-      // Normaliza PCM 16-bit para o intervalo [-1.0, 1.0] exigido pela Web Audio API
+      // Normalização para o padrão Web Audio API
       channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
     }
   }
   return buffer;
 }
 
-// Singleton para o contexto de áudio para evitar múltiplas instâncias
 let audioCtx: AudioContext | null = null;
 
 export async function speak(text: string): Promise<void> {
-  if (!text || !text.trim()) return;
+  const cleanText = text?.trim();
+  if (!cleanText) return;
 
   try {
-    // 1. Prepara o contexto de áudio (deve ser iniciado por interação do usuário)
+    // Inicialização segura do AudioContext
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
@@ -47,19 +47,18 @@ export async function speak(text: string): Promise<void> {
       await audioCtx.resume();
     }
 
-    // 2. Inicializa o cliente GenAI
+    // Criação da instância GenAI imediata para capturar a API_KEY corretamente
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-    // 3. Gera o conteúdo de áudio (TTS)
-    // Usamos um texto limpo para evitar erros internos de processamento
+    // Chamada do modelo TTS
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: text.trim() }] }],
+      contents: [{ parts: [{ text: cleanText }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
           voiceConfig: {
-            // "Kore" é uma voz estável com velocidade natural 1x
+            // "Kore" é a voz recomendada para velocidade natural 1x
             prebuiltVoiceConfig: { voiceName: 'Kore' },
           },
         },
@@ -68,11 +67,9 @@ export async function speak(text: string): Promise<void> {
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) {
-      console.warn("Nenhum dado de áudio retornado pelo modelo.");
-      return;
+      throw new Error("O modelo não retornou dados de áudio.");
     }
 
-    // 4. Decodifica o PCM e reproduz
     const audioData = decodeBase64(base64Audio);
     const audioBuffer = await decodeAudioData(audioData, audioCtx, 24000, 1);
 
@@ -83,9 +80,10 @@ export async function speak(text: string): Promise<void> {
 
   } catch (error: any) {
     console.error("Erro no Sistema TTS:", error);
-    // Erros 500 costumam ser problemas temporários no servidor de preview
+    
+    // Fallback ou Log detalhado para erro 500
     if (error.message?.includes("500") || error.message?.includes("INTERNAL")) {
-      console.warn("O serviço TTS encontrou um erro interno (500). Tente novamente em alguns segundos.");
+      console.warn("Instabilidade detectada no servidor Gemini TTS. Tente clicar novamente.");
     }
   }
 }
