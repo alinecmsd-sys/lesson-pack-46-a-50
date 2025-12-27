@@ -31,28 +31,33 @@ async function decodeAudioData(
   return buffer;
 }
 
-// Singleton do AudioContext para evitar o erro "too many audio contexts"
+// Singleton do AudioContext
 let audioCtx: AudioContext | null = null;
 
-export async function speak(text: string, isRetry = false): Promise<void> {
-  const cleanText = text?.trim().replace(/[*_#]/g, '');
+export async function speak(text: string, retryCount = 0): Promise<void> {
+  // Limpeza profunda do texto para evitar erros de processamento no modelo preview
+  const cleanText = text?.trim()
+    .replace(/[*_#]/g, '') // Remove markdown
+    .replace(/[\[\]()]/g, '') // Remove parênteses
+    .replace(/\s+/g, ' '); // Normaliza espaços
+    
   if (!cleanText) return;
 
   try {
-    // 1. Inicializa o AudioContext apenas na primeira interação do usuário
+    // 1. Inicializa ou recupera o AudioContext
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
 
-    // 2. OBRIGATÓRIO: Retomar o contexto (necessário para browsers em produção)
+    // 2. Essencial para produção: Retomar o contexto em cada clique do usuário
     if (audioCtx.state === 'suspended') {
       await audioCtx.resume();
     }
 
-    // 3. Instancia o SDK (usamos o process.env.API_KEY injetado)
+    // 3. Cria uma nova instância para garantir o uso da API Key mais recente
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-    // 4. Solicitação de TTS
+    // 4. Solicitação de TTS (Velocidade 1x é o padrão da voz Kore)
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
       contents: [{ parts: [{ text: cleanText }] }],
@@ -67,12 +72,12 @@ export async function speak(text: string, isRetry = false): Promise<void> {
     });
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    
     if (!base64Audio) {
-      console.error("Nenhum dado de áudio recebido da API.");
-      return;
+      throw new Error("EMPTY_AUDIO_RESPONSE");
     }
 
-    // 5. Reprodução do Áudio
+    // 5. Reprodução
     const audioData = decodeBase64(base64Audio);
     const audioBuffer = await decodeAudioData(audioData, audioCtx, 24000, 1);
 
@@ -82,21 +87,23 @@ export async function speak(text: string, isRetry = false): Promise<void> {
     source.start(0);
 
   } catch (error: any) {
-    console.error("Erro no Sistema TTS:", error);
+    console.error(`Erro TTS (Tentativa ${retryCount + 1}):`, error);
 
-    // Tratamento de Erro 500 (Instabilidade do Servidor)
-    const isInternalError = error.message?.includes("500") || error.message?.includes("INTERNAL");
-    
-    if (isInternalError && !isRetry) {
-      console.warn("Servidor Gemini instável. Tentando reconexão...");
-      // Espera 1.5s antes de tentar novamente (Exponential backoff simples)
-      await new Promise(r => setTimeout(r, 1500));
-      return speak(text, true);
+    // Lógica de Retry para Erro 500 ou Erro Interno (comum no deploy)
+    const isRetryable = error.message?.includes("500") || 
+                        error.message?.includes("INTERNAL") || 
+                        error.message?.includes("fetch");
+
+    if (isRetryable && retryCount < 2) {
+      const delay = 1000 * (retryCount + 1);
+      console.warn(`Erro interno detectado. Tentando novamente em ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return speak(text, retryCount + 1);
     }
     
-    // Alerta amigável para o usuário em caso de erro persistente
-    if (isRetry) {
-      alert("O serviço de áudio do Google está temporariamente instável. Por favor, tente novamente em alguns instantes.");
+    // Se falhar após retentativas, exibe erro silencioso no log ou alerta controlado
+    if (retryCount >= 2) {
+      console.error("Falha persistente no serviço de áudio Gemini.");
     }
   }
 }
