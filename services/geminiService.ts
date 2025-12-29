@@ -1,11 +1,9 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 
-// Funções de decodificação manuais conforme diretrizes oficiais
 function decode(base64: string): Uint8Array {
   const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
     bytes[i] = binaryString.charCodeAt(i);
   }
   return bytes;
@@ -17,38 +15,49 @@ async function decodeAudioData(
   sampleRate: number,
   numChannels: number,
 ): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
+  // Ensure 2-byte alignment for Int16Array
+  let buffer = data.buffer;
+  let offset = data.byteOffset;
+  if (offset % 2 !== 0) {
+    buffer = data.slice().buffer;
+    offset = 0;
+  }
+
+  const dataInt16 = new Int16Array(buffer, offset, Math.floor(data.byteLength / 2));
   const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+  const audioBuffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
 
   for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
+    const channelData = audioBuffer.getChannelData(channel);
     for (let i = 0; i < frameCount; i++) {
       channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
     }
   }
-  return buffer;
+  return audioBuffer;
 }
 
 let audioCtx: AudioContext | null = null;
 
-// Saneamento radical: remove qualquer coisa que não seja alfanumérica simples ou pontuação básica
-function sanitizeForTTS(text: string): string {
+/**
+ * Strips speaker markers (A:, B:, etc.) and other non-verbal symbols 
+ * that might confuse the single-speaker TTS model.
+ */
+function cleanForSpeech(text: string): string {
   return text
+    .replace(/[A-Z]:\s*/g, " ") // Remove "A: " markers
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, "") // Remove acentos se houver
-    .replace(/[*_#\[\]()]/g, "") // Remove markdown
-    .replace(/[^a-zA-Z0-9\s.,?!']/g, " ") // Mantém apenas o essencial
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\[\]\-_:;()]/g, " ")
+    .replace(/[^a-zA-Z0-9\s.,?!']/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
 export async function speak(text: string, retryCount = 0): Promise<void> {
-  const cleanText = sanitizeForTTS(text);
+  const cleanText = cleanForSpeech(text);
   if (!cleanText) return;
 
   try {
-    // 1. Gerenciamento do Contexto de Áudio (Crucial para produção/Vercel)
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
@@ -57,30 +66,47 @@ export async function speak(text: string, retryCount = 0): Promise<void> {
       await audioCtx.resume();
     }
 
-    // 2. Inicialização do Cliente
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-    // 3. Chamada simplificada para o modelo (evita prefixos que causam erro 500)
+    // Using a very simple prompt to minimize text preamble from the model
+    const prompt = `Text to read: ${cleanText}`;
+
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: cleanText }] }],
+      contents: [{ parts: [{ text: prompt }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Kore' },
+            prebuiltVoiceConfig: { voiceName: "Puck" },
           },
         },
       },
     });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    let base64Audio: string | undefined;
+    let fallbackText: string = "";
+
+    // Iterate through all parts of the first candidate to find inline audio data
+    const parts = response.candidates?.[0]?.content?.parts;
+    if (parts) {
+      for (const part of parts) {
+        if (part.inlineData?.data) {
+          base64Audio = part.inlineData.data;
+          break; // Found the audio!
+        } else if (part.text) {
+          fallbackText += part.text;
+        }
+      }
+    }
     
     if (!base64Audio) {
-      throw new Error("EMPTY_AUDIO");
+      if (fallbackText) {
+        console.warn("Model returned text instead of audio:", fallbackText);
+      }
+      throw new Error("EMPTY_AUDIO_DATA");
     }
 
-    // 4. Execução do Áudio
     const audioData = decode(base64Audio);
     const audioBuffer = await decodeAudioData(audioData, audioCtx, 24000, 1);
 
@@ -90,13 +116,17 @@ export async function speak(text: string, retryCount = 0): Promise<void> {
     source.start(0);
 
   } catch (error: any) {
-    console.error(`TTS Production Error (Attempt ${retryCount + 1}):`, error);
+    console.error(`TTS Service Failure (Attempt ${retryCount + 1}):`, error);
 
-    // Se for erro 500, tentamos apenas uma vez com um atraso maior
-    const isInternal = error.message?.includes("500") || error.message?.includes("INTERNAL");
+    const isRetryable = error.message?.includes("500") || 
+                        error.message?.includes("INTERNAL") ||
+                        error.message === "EMPTY_AUDIO_DATA" ||
+                        error.name === 'AbortError';
     
-    if (isInternal && retryCount < 1) {
-      await new Promise(r => setTimeout(r, 1500));
+    if (isRetryable && retryCount < 2) {
+      const delay = 1000 + (retryCount * 2000);
+      console.warn(`Attempting recovery in ${delay}ms...`);
+      await new Promise(r => setTimeout(r, delay));
       return speak(text, retryCount + 1);
     }
   }
