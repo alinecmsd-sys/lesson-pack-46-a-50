@@ -1,6 +1,6 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 
-// Standard decoding functions as per Gemini API documentation
+// Funções de decodificação manuais conforme diretrizes oficiais
 function decode(base64: string): Uint8Array {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -32,29 +32,23 @@ async function decodeAudioData(
 
 let audioCtx: AudioContext | null = null;
 
-/**
- * Clean text for TTS. 
- * The 500 error is often triggered by special characters or formatting
- * that the preview TTS model doesn't handle well.
- */
-function sanitizeTextForTTS(text: string): string {
+// Saneamento radical: remove qualquer coisa que não seja alfanumérica simples ou pontuação básica
+function sanitizeForTTS(text: string): string {
   return text
-    .replace(/[*_#\[\]()]/g, '') // Remove markdown
-    .replace(/[^\w\s.,?!']/gi, ' ') // Remove non-standard symbols
-    .replace(/\s+/g, ' ') // Collapse spaces
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, "") // Remove acentos se houver
+    .replace(/[*_#\[\]()]/g, "") // Remove markdown
+    .replace(/[^a-zA-Z0-9\s.,?!']/g, " ") // Mantém apenas o essencial
+    .replace(/\s+/g, " ")
     .trim();
 }
 
 export async function speak(text: string, retryCount = 0): Promise<void> {
-  // Use progressively simpler text on retries to avoid 500 errors
-  const cleanText = retryCount === 0 
-    ? sanitizeTextForTTS(text)
-    : text.replace(/[^a-zA-Z0-9\s]/g, ' ').trim(); // Ultra-safe fallback
-
+  const cleanText = sanitizeForTTS(text);
   if (!cleanText) return;
 
   try {
-    // 1. Initialize or resume AudioContext
+    // 1. Gerenciamento do Contexto de Áudio (Crucial para produção/Vercel)
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
@@ -63,13 +57,13 @@ export async function speak(text: string, retryCount = 0): Promise<void> {
       await audioCtx.resume();
     }
 
-    // 2. Create fresh client instance
+    // 2. Inicialização do Cliente
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-    // 3. Generate content with explicit system instruction to stabilize engine
+    // 3. Chamada simplificada para o modelo (evita prefixos que causam erro 500)
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `Say clearly: ${cleanText}` }] }],
+      contents: [{ parts: [{ text: cleanText }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -83,10 +77,10 @@ export async function speak(text: string, retryCount = 0): Promise<void> {
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     
     if (!base64Audio) {
-      throw new Error("EMPTY_TTS_RESPONSE");
+      throw new Error("EMPTY_AUDIO");
     }
 
-    // 4. Play audio
+    // 4. Execução do Áudio
     const audioData = decode(base64Audio);
     const audioBuffer = await decodeAudioData(audioData, audioCtx, 24000, 1);
 
@@ -96,15 +90,13 @@ export async function speak(text: string, retryCount = 0): Promise<void> {
     source.start(0);
 
   } catch (error: any) {
-    console.error(`TTS Error (Attempt ${retryCount + 1}):`, error);
+    console.error(`TTS Production Error (Attempt ${retryCount + 1}):`, error);
 
-    // Handle 500 INTERNAL or other transient network errors
-    const isInternalError = error.message?.includes("500") || error.message?.includes("INTERNAL");
+    // Se for erro 500, tentamos apenas uma vez com um atraso maior
+    const isInternal = error.message?.includes("500") || error.message?.includes("INTERNAL");
     
-    if ((isInternalError || error.name === 'AbortError') && retryCount < 2) {
-      const waitTime = (retryCount + 1) * 800; // Shorter backoff
-      console.warn(`Internal error detected. Retrying with simplified text in ${waitTime}ms...`);
-      await new Promise(r => setTimeout(r, waitTime));
+    if (isInternal && retryCount < 1) {
+      await new Promise(r => setTimeout(r, 1500));
       return speak(text, retryCount + 1);
     }
   }
